@@ -1,0 +1,153 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+#define RXD2 16
+#define TXD2 17
+#define DERE 4
+#define PIN_ALARMA 35
+
+const char* ssid       = "IZZI-710F";
+const char* password   = "21102005";
+const char* serverName = "http://IP_DEL_DISPOSITIVO:5000/api/medicion";
+
+HardwareSerial modbus(2);
+
+volatile uint16_t Diameter     = 0;
+volatile bool     alarma_activa = false;
+
+uint16_t crc16(uint8_t *buf, int len) {
+    uint16_t crc = 0xFFFF;
+    for (int pos = 0; pos < len; pos++) {
+        crc ^= buf[pos];
+        for (int i = 8; i != 0; i--) {
+            if (crc & 0x0001) { crc >>= 1; crc ^= 0xA001; }
+            else               { crc >>= 1; }
+        }
+    }
+    return crc;
+}
+
+void IRAM_ATTR ISR_alarma() {
+    alarma_activa = true;
+}
+
+void initWifi() {
+    Serial.print("Conectando a: ");
+    Serial.print(ssid);
+    WiFi.begin(ssid, password);
+    int timeout = 40;
+    while (WiFi.status() != WL_CONNECTED && timeout-- > 0) {
+        delay(250);
+        Serial.print(".");
+    }
+    Serial.println(WiFi.status() == WL_CONNECTED ? "\nWiFi conectado" : "\nFallo WiFi");
+    Serial.println(WiFi.localIP());
+}
+
+void enviarMedicion(float diametro_mm, bool nuevo_lote) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    
+    HTTPClient http;
+    http.begin(serverName);
+    http.addHeader("Content-Type", "application/json");
+    
+    String jsonData;
+    if (nuevo_lote) {
+        jsonData = "{\"mm\":" + String(diametro_mm, 3) + ",\"nuevo_lote\":true}";
+    } else {
+        jsonData = "{\"mm\":" + String(diametro_mm, 3) + "}";
+    }
+    
+    Serial.print("Enviando: ");
+    Serial.println(jsonData);
+    
+    int code = http.POST(jsonData);
+    
+    if (code > 0) {
+        Serial.print("Respuesta: ");
+        Serial.println(http.getString());
+    } else {
+        Serial.print("Error: ");
+        Serial.println(code);
+    }
+    
+    http.end();
+}
+
+void tareaModbus(void *parameter) {
+    uint8_t resp[7];
+    while (true) {
+        uint8_t frame[8] = {0x01, 0x04, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x00};
+        uint16_t crc = crc16(frame, 6);
+        frame[6] = crc & 0xFF;
+        frame[7] = crc >> 8;
+
+        digitalWrite(DERE, HIGH);
+        delayMicroseconds(500);
+        modbus.write(frame, 8);
+        delay(35);
+        digitalWrite(DERE, LOW);
+
+        unsigned long t = millis();
+        while (modbus.available() < 7 && millis() - t < 500);
+
+        if (modbus.available() >= 7) {
+            modbus.readBytes(resp, 7);
+            if (resp[1] == 0x04 && resp[2] == 0x02) {
+                Diameter = ((uint16_t)resp[3] << 8) | resp[4];
+                float diameter_mm = Diameter / 1000.0f;
+                Serial.print("Diametro (mm): ");
+                Serial.println(diameter_mm, 3);
+            } else {
+                Serial.println("Respuesta invalida");
+                Diameter = 0;
+            }
+        } else {
+            while (modbus.available()) modbus.read();
+            Serial.println("Sin respuesta del sensor");
+            Diameter = 0;
+        }
+
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+void tareaWifi(void *parameter) {
+    while (true) {
+        static bool lote_anterior = false;
+        
+        if (alarma_activa && !lote_anterior) {
+            Serial.println("¡Nuevo lote detectado!");
+            float diametro_mm = Diameter / 1000.0f;
+            enviarMedicion(diametro_mm, true);
+            lote_anterior = true;
+            alarma_activa = false;
+        } else if (!alarma_activa && lote_anterior) {
+            lote_anterior = false;
+        } else if (Diameter > 0 && !alarma_activa) {
+            float diametro_mm = Diameter / 1000.0f;
+            enviarMedicion(diametro_mm, false);
+        }
+        
+        vTaskDelay(1000 / portTICK_PERIOD_MS);  // Envía cada 1 segundo
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    modbus.begin(2400, SERIAL_8N1, RXD2, TXD2);
+    modbus.setTimeout(500);
+    pinMode(DERE, OUTPUT);
+    digitalWrite(DERE, LOW);
+    pinMode(PIN_ALARMA, INPUT);
+    attachInterrupt(digitalPinToInterrupt(PIN_ALARMA), ISR_alarma, RISING);
+    initWifi();
+    WiFi.setAutoReconnect(true);
+
+    xTaskCreatePinnedToCore(tareaModbus, "Modbus", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(tareaWifi,   "Wifi",   4096, NULL, 1, NULL, 1);
+}
+
+void loop() {
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+}

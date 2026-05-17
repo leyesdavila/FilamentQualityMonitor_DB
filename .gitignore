@@ -1,0 +1,16 @@
+# Python
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Build y distribución  
+build/
+dist/
+*.spec
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
